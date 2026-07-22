@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+--find-links https://data.dgl.ai/wheels/torch-2.1/repo.html
+
+numpy<2.0.0
+pandas
+scikit-learn<1.6.0
+category_encoders
+networkx
+pyarrow
+torch==2.1.2+cpu
+torchdata==0.7.1
+dgl
+pyyaml
+pydantic
