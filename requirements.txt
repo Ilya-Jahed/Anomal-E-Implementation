@@ -12,3 +12,4 @@ torchdata==0.7.1
 dgl
 pyyaml
 pydantic
+pyod

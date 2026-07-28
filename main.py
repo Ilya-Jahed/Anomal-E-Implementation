@@ -1,64 +1,68 @@
 import os
+import torch
 from src.data_pipeline.preprocessor import AnomalEPreprocessor
 from src.data_pipeline.graph_builder import AnomalEGraphBuilder
-# Import the newly implemented AnomalEDGI module
 from src.models.dgi_module import AnomalEDGI
+from src.models.e_graphsage import AnomalESAGEEncoder
+# Import the new Anomaly Detector wrapper
+from src.models.anomaly_detectors import AnomalEDetector
 
 def main():
-    # Define the dataset path.
     dataset_path = "data/raw/NF-CSE-CIC-IDS2018-v2.csv"    
     
-    # Check if the file exists before running
     if not os.path.exists(dataset_path):
         print(f"[ERROR] Dataset not found at: {dataset_path}")
-        print("Please place the original 'NF-CSE-CIC-IDS2018-v2.csv' inside the 'data/raw' folder.")
         return
 
     print("=== Starting Phase 1: Data Pipeline ===")
-    
-    # 1. Initialize Preprocessor and run pipeline in Sanity Check mode
     preprocessor = AnomalEPreprocessor()
     train_df, test_df = preprocessor.process_pipeline(dataset_path, sanity_check=True)
     
-    # 2. Initialize Graph Builder and generate DGL graphs.
     graph_builder = AnomalEGraphBuilder()
     train_g, test_g = graph_builder.generate_graphs(train_df, test_df)
+    print("=== Phase 1 Execution Successful ===\n")
     
-    print("\n=== Phase 1 Execution Successful ===")
-    
-    # --- INSPECTING THE GENERATED GRAPHS ---
-    print("\n[INSPECTION] Tensor Dimensions (Training Graph):")
-    print(f"Node Features (ndata['h']) shape: {train_g.ndata['h'].shape}")
-    print(f"Edge Features (edata['h']) shape: {train_g.edata['h'].shape}")
-    print("-" * 50)
-
     # ==========================================
-    # Phase 2: DGI Module Sanity Check
+    # Phase 2: Encoder & DGI Sanity Check
     # ==========================================
-    print("\n=== Starting Phase 2: DGI Module Sanity Check ===")
-    
-    # Automatically extract dimensions from the generated DGL graph
+    print("=== Starting Phase 2: DGI & Encoder Sanity Check ===")
     ndim_in = train_g.ndata['h'].shape[2]
     edims = train_g.edata['h'].shape[2]
     hidden_dim = 128
     edge_hidden_dim = 256
     
-    print("Initializing AnomalEDGI model...")
-    dgi_model = AnomalEDGI(
-        ndim_in=ndim_in, 
-        edims=edims, 
-        ndim_out=hidden_dim, 
-        edge_out_dim=edge_hidden_dim
-    )
-    
-    print("Running DGI forward pass to compute loss...")
-    # Pass the graph and features to the DGI module
+    # 1. Test DGI Loss
+    dgi_model = AnomalEDGI(ndim_in, edims, hidden_dim, edge_hidden_dim)
     loss = dgi_model(train_g, train_g.ndata['h'], train_g.edata['h'])
+    print(f"Calculated DGI Loss: {loss.item():.4f}")
     
-    print(f"Calculated Loss Value: {loss.item():.4f}")
-    print(f"Loss Tensor shape: {loss.shape} -> (Expected: torch.Size([]))")
+    # 2. Get real embeddings from Encoder for Phase 3
+    print("Extracting edge embeddings from Encoder...")
+    encoder = AnomalESAGEEncoder(ndim_in, edims, hidden_dim, edge_hidden_dim)
+    _, out_e = encoder(train_g, train_g.ndata['h'], train_g.edata['h'], corrupt=False)
+    print("=== Phase 2 Execution Successful ===\n")
+
+    # ==========================================
+    # NEW: Phase 3: Anomaly Detector Sanity Check
+    # ==========================================
+    print("=== Starting Phase 3: Anomaly Detector Sanity Check ===")
+    print("Initializing HBOS Anomaly Detector...")
     
-    print("\n=== Phase 2 DGI Sanity Check Successful! ===")
+    # Create the detector (e.g., HBOS) with a 10% expected anomaly rate
+    detector = AnomalEDetector(model_name='hbos', contamination=0.10)
+    
+    # Train the detector on the extracted edge embeddings (out_e)
+    print(f"Fitting model on embedding tensor of shape {out_e.shape}...")
+    detector.fit(out_e)
+    
+    # Predict normal (0) vs anomalous (1) labels
+    predictions = detector.predict(out_e)
+    
+    # Calculate some basic stats to ensure it worked
+    num_anomalies = sum(predictions)
+    total_samples = len(predictions)
+    print(f"Prediction complete! Found {num_anomalies} anomalies out of {total_samples} edges.")
+    print("=== Phase 3 Execution Successful! ===")
 
 if __name__ == "__main__":
     main()

@@ -14,6 +14,7 @@ The key technical innovations:
 
 - **E-GraphSAGE**: Unlike standard GraphSAGE which aggregates node features from neighbours, E-GraphSAGE aggregates **edge features** (bytes, packet counts, duration) — because in NetFlow data, the meaningful information lives on the connection, not on the IP address itself.
 - **DGI self-supervised training**: The encoder is trained by comparing real graph embeddings against embeddings of a corrupted graph (same topology, shuffled edge features). No labels required.
+- **Classical unsupervised scoring**: The trained edge embeddings are handed off to well-understood detectors (PCA, HBOS, CBLOF, Isolation Forest) that never see a label either — keeping the whole pipeline label-free end to end.
 
 ---
 
@@ -36,16 +37,17 @@ Anomal-E-Implementation/
 │   ├── models/
 │   │   ├── e_graphsage.py          # AnomalESAGELayer + AnomalESAGEEncoder
 │   │   ├── dgi_module.py           # Discriminator + AnomalEDGI training module
-│   │   └── anomaly_detectors.py    # PCA / IF / CBLOF / HBOS  [Phase 3 — coming soon]
+│   │   └── anomaly_detectors.py    # AnomalEDetector: PCA / IF / CBLOF / HBOS
 │   │
 │   └── engine/
 │       ├── trainer.py              # DGI training loop              [Phase 4 — coming soon]
 │       └── evaluator.py            # Embedding evaluation           [Phase 4 — coming soon]
 │
 ├── docs/
-│   ├── DATA_PIPELINE_EXPLANATION.md      # Deep-dive on preprocessor + graph builder
-│   ├── E_GRAPHSAGE_EXPLANATION.md        # Deep-dive on AnomalESAGELayer + Encoder
-│   └── DGI_MODULE_EXPLANATION.md         # Deep-dive on Discriminator + AnomalEDGI
+│   ├── DATA_PIPELINE_EXPLANATION.md          # Deep-dive on preprocessor + graph builder
+│   ├── E_GRAPHSAGE_EXPLANATION.md            # Deep-dive on AnomalESAGELayer + Encoder
+│   ├── DGI_MODULE_EXPLANATION.md             # Deep-dive on Discriminator + AnomalEDGI
+│   └── ANOMAL-E_DETECTOR_EXPLANATION.md      # Deep-dive on AnomalEDetector (PCA/HBOS/CBLOF/IForest)
 │
 ├── configs/                        # Hyperparameter configs (future use)
 ├── notebooks/                      # Exploratory notebooks (future use)
@@ -82,9 +84,9 @@ Raw CSV (NetFlow data)
    Summary:        sigmoid(mean(pos_edge_emb))
    Loss:           BCE(discriminator(pos) vs 1) + BCE(discriminator(neg) vs 0)
         │
-        ▼  anomaly_detectors.py  [Phase 3]
-   Fit PCA / IF / CBLOF / HBOS on trained edge embeddings
-   Score each flow → anomaly score
+        ▼  anomaly_detectors.py  (AnomalEDetector)
+   Fit PCA / IF / CBLOF / HBOS on trained edge embeddings — unsupervised
+   Score each flow → anomaly score / benign-attack label
 ```
 
 ---
@@ -162,6 +164,7 @@ Each implemented module has a corresponding deep-dive document in `docs/` that m
 | [`DATA_PIPELINE_EXPLANATION.md`](docs/DATA_PIPELINE_EXPLANATION.md) | Preprocessing steps, target encoding, L2 normalisation, graph construction, `ndata`/`edata` structure |
 | [`E_GRAPHSAGE_EXPLANATION.md`](docs/E_GRAPHSAGE_EXPLANATION.md) | `AnomalESAGELayer` (message passing, node update, edge update), `AnomalESAGEEncoder` (DGI corruption, layer stacking), `g.ndata` deep-dive |
 | [`DGI_MODULE_EXPLANATION.md`](docs/DGI_MODULE_EXPLANATION.md) | `Discriminator` (bilinear form, `nn.Parameter` vs `nn.Linear`), `AnomalEDGI` (full Algorithm 2 mapping, loss computation) |
+| [`ANOMAL-E_DETECTOR_EXPLANATION.md`](docs/ANOMAL-E_DETECTOR_EXPLANATION.md) | `AnomalEDetector` (PCA / HBOS / CBLOF / Isolation Forest wrapping via PyOD, `contamination` meaning, `fit`/`predict`/`get_anomaly_scores`) |
 
 ---
 
@@ -178,9 +181,10 @@ Each implemented module has a corresponding deep-dive document in `docs/` that m
   - `Discriminator`: bilinear scoring (Eq. 6/7)
   - `AnomalEDGI`: full self-supervised training objective (Algorithm 2)
 
-- [ ] **Phase 3 — Unsupervised Anomaly Detectors**
-  - PCA, Isolation Forest, CBLOF, HBOS fitted on trained edge embeddings
-  - Per-flow anomaly scoring without attack labels
+- [x] **Phase 3 — Unsupervised Anomaly Detectors**
+  - `AnomalEDetector`: unified PyOD wrapper for PCA, HBOS, CBLOF, Isolation Forest
+  - Fitted directly on trained edge embeddings — fully label-free
+  - Per-flow binary label (`predict`) and continuous severity score (`get_anomaly_scores`)
 
 - [ ] **Phase 4 — Execution Engine**
   - `Trainer`: DGI training loop with optimizer, scheduler, checkpointing
