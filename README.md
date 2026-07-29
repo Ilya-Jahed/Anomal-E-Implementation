@@ -40,14 +40,15 @@ Anomal-E-Implementation/
 │   │   └── anomaly_detectors.py    # AnomalEDetector: PCA / IF / CBLOF / HBOS
 │   │
 │   └── engine/
-│       ├── trainer.py              # DGI training loop              [Phase 4 — coming soon]
-│       └── evaluator.py            # Embedding evaluation           [Phase 4 — coming soon]
+│       ├── trainer.py              # AnomalETrainer: DGI training loop + evaluation
+│       └── evaluator.py            # (folded into trainer.py's evaluate() — see below)
 │
 ├── docs/
 │   ├── DATA_PIPELINE_EXPLANATION.md          # Deep-dive on preprocessor + graph builder
 │   ├── E_GRAPHSAGE_EXPLANATION.md            # Deep-dive on AnomalESAGELayer + Encoder
 │   ├── DGI_MODULE_EXPLANATION.md             # Deep-dive on Discriminator + AnomalEDGI
-│   └── ANOMAL-E_DETECTOR_EXPLANATION.md      # Deep-dive on AnomalEDetector (PCA/HBOS/CBLOF/IForest)
+│   ├── ANOMAL-E_DETECTOR_EXPLANATION.md      # Deep-dive on AnomalEDetector (PCA/HBOS/CBLOF/IForest)
+│   └── TRAINER_EXPLANATION.md                # Deep-dive on AnomalETrainer (train/evaluate/checkpoints)
 │
 ├── configs/                        # Hyperparameter configs (future use)
 ├── notebooks/                      # Exploratory notebooks (future use)
@@ -71,6 +72,7 @@ Raw CSV (NetFlow data)
    Each row → one directed edge (src IP → dst IP)
    Node features = constant vector of 1s (same dim as edge features)
    Result: DGL bidirectional graph with ndata['h'] and edata['h']
+   (Label/Attack carried as edge attributes -- see trainer.py notes below)
         │
         ▼  e_graphsage.py  (AnomalESAGELayer)
    1. Each edge sends its feature vector to its destination node
@@ -84,9 +86,19 @@ Raw CSV (NetFlow data)
    Summary:        sigmoid(mean(pos_edge_emb))
    Loss:           BCE(discriminator(pos) vs 1) + BCE(discriminator(neg) vs 0)
         │
+        ▼  trainer.py  (AnomalETrainer)
+   train():    zero_grad → dgi_model(g, n, e) → backward → step, for N epochs
+               (fully label-free -- Algorithm 2, lines 2-9)
+   evaluate(): freeze encoder → extract edge embeddings → fit detector
+               → predict + score → compare against g.edata['Label']
+               (labels used ONLY here, for scoring -- Section 4.4, Tables 3-8)
+        │
         ▼  anomaly_detectors.py  (AnomalEDetector)
    Fit PCA / IF / CBLOF / HBOS on trained edge embeddings — unsupervised
    Score each flow → anomaly score / benign-attack label
+        │
+        ▼  main.py
+   Wires every component above together and runs the full experiment
 ```
 
 ---
@@ -129,7 +141,7 @@ data/raw/NF-CSE-CIC-IDS2018-v2.csv
 python main.py
 ```
 
-This runs the full Phase 1 + Phase 2 pipeline in **sanity-check mode** (50,000 rows), confirming end-to-end correctness before committing to a full multi-million-row run. Expected output:
+This runs the **complete** pipeline — data preprocessing, graph construction, DGI self-supervised training, and detector-based evaluation — in **sanity-check mode** (50,000 rows), confirming end-to-end correctness before committing to a full multi-million-row run. Expected output (abridged):
 
 ```
 === Starting Phase 1: Data Pipeline ===
@@ -145,12 +157,32 @@ This runs the full Phase 1 + Phase 2 pipeline in **sanity-check mode** (50,000 r
 [INFO] Building Testing Graph...
 [SUCCESS] Graphs generated. Train Nodes: ..., Train Edges: ...
 
-=== Phase 1 Execution Successful ===
+=== Starting Final Phase: Execution Engine ===
+Initializing DGI Model...
+Initializing HBOS Detector...
 
-[INSPECTION] Training Graph Overview:
+--- Starting DGI Training for 50 Epochs ---
+Epoch 001/50 | Loss: ... | Time: ...s
+Epoch 005/50 | Loss: ... | Time: ...s
 ...
-Node Features (ndata['h']) shape: (N, 1, F)
-Edge Features (edata['h']) shape: (E, 1, F)
+Epoch 050/50 | Loss: 1.3913 | Time: 0.1146s
+--- DGI Training Completed | Total Time: 5.93s | Final Loss: 1.3913 | Best Loss: 1.3514 (Epoch 48) ---
+
+--- Starting Evaluation Phase ---
+1. Extracting edge embeddings from the trained Encoder...
+2. Fitting HBOS model on embeddings...
+3. Predicting anomalies and calculating scores...
+
+======================================
+📊 FINAL MODEL PERFORMANCE METRICS
+======================================
+ROC AUC Score : 0.xxxx
+F1 Score      : 0.xxxx
+Precision     : 0.xxxx
+Recall        : 0.xxxx
+======================================
+
+🎉 === ANOMAL-E PIPELINE SUCCESSFULLY COMPLETED === 🎉
 ```
 
 ---
@@ -165,6 +197,7 @@ Each implemented module has a corresponding deep-dive document in `docs/` that m
 | [`E_GRAPHSAGE_EXPLANATION.md`](docs/E_GRAPHSAGE_EXPLANATION.md) | `AnomalESAGELayer` (message passing, node update, edge update), `AnomalESAGEEncoder` (DGI corruption, layer stacking), `g.ndata` deep-dive |
 | [`DGI_MODULE_EXPLANATION.md`](docs/DGI_MODULE_EXPLANATION.md) | `Discriminator` (bilinear form, `nn.Parameter` vs `nn.Linear`), `AnomalEDGI` (full Algorithm 2 mapping, loss computation) |
 | [`ANOMAL-E_DETECTOR_EXPLANATION.md`](docs/ANOMAL-E_DETECTOR_EXPLANATION.md) | `AnomalEDetector` (PCA / HBOS / CBLOF / Isolation Forest wrapping via PyOD, `contamination` meaning, `fit`/`predict`/`get_anomaly_scores`) |
+| [`TRAINER_EXPLANATION.md`](docs/TRAINER_EXPLANATION.md) | `AnomalETrainer` (`train()`/`evaluate()` split, why labels are read from `g.edata['Label']` and never from a separately-supplied array, checkpointing) |
 
 ---
 
@@ -186,9 +219,17 @@ Each implemented module has a corresponding deep-dive document in `docs/` that m
   - Fitted directly on trained edge embeddings — fully label-free
   - Per-flow binary label (`predict`) and continuous severity score (`get_anomaly_scores`)
 
-- [ ] **Phase 4 — Execution Engine**
-  - `Trainer`: DGI training loop with optimizer, scheduler, checkpointing
-  - `Evaluator`: AUC-ROC, F1, precision/recall on test graph embeddings
+- [x] **Phase 4 — Execution Engine**
+  - `AnomalETrainer.train()`: DGI training loop (optimizer step, loss logging, best-epoch tracking)
+  - `AnomalETrainer.evaluate()`: frozen-encoder embedding extraction, detector fitting, ROC AUC / F1 / Precision / Recall
+  - Ground-truth labels read directly from `g.edata['Label']` (guaranteed aligned with edge embeddings, unlike a dataframe-order array — see `TRAINER_EXPLANATION.md` §4a)
+  - `save_checkpoint()` / `load_checkpoint()` for resuming training or reusing a trained encoder across detector sweeps
+  - `main.py` fully wires Phases 1–4 into one runnable, sanity-checkable script
+
+- [ ] **Phase 5 — Full-Scale Run & Experiment Tracking**
+  - Move execution to a GPU-backed environment (Colab) for a full (non-`sanity_check`) run on the complete multi-million-row dataset
+  - Reproduce the paper's grid search over detector hyperparameters and contamination levels (Table 2) using `save_checkpoint`/`load_checkpoint` to avoid retraining the encoder per sweep
+  - Compare results against the paper's Tables 3–8 (raw features vs. Anomal-E embeddings, 0% vs. 4% contamination)
 
 ---
 

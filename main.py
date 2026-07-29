@@ -3,9 +3,8 @@ import torch
 from src.data_pipeline.preprocessor import AnomalEPreprocessor
 from src.data_pipeline.graph_builder import AnomalEGraphBuilder
 from src.models.dgi_module import AnomalEDGI
-from src.models.e_graphsage import AnomalESAGEEncoder
-# Import the new Anomaly Detector wrapper
 from src.models.anomaly_detectors import AnomalEDetector
+from src.engine.trainer import AnomalETrainer
 
 def main():
     dataset_path = "data/raw/NF-CSE-CIC-IDS2018-v2.csv"    
@@ -16,53 +15,49 @@ def main():
 
     print("=== Starting Phase 1: Data Pipeline ===")
     preprocessor = AnomalEPreprocessor()
+    # Using sanity_check=True for fast execution
     train_df, test_df = preprocessor.process_pipeline(dataset_path, sanity_check=True)
-    
+
+    # NOTE: we no longer extract a separate test_labels array from test_df here.
+    # trainer.evaluate() now reads ground-truth labels directly from
+    # test_g.edata['Label'] instead -- this is the array that is guaranteed to
+    # be in the same edge order as the embeddings the encoder produces (see
+    # trainer.py's evaluate() docstring / section 4a of its README for why a
+    # dataframe-order array like test_df['Label'].values can NOT be trusted
+    # to line up with the graph's edges after graph_builder's
+    # MultiGraph -> to_directed() conversion).
+
     graph_builder = AnomalEGraphBuilder()
     train_g, test_g = graph_builder.generate_graphs(train_df, test_df)
-    print("=== Phase 1 Execution Successful ===\n")
     
-    # ==========================================
-    # Phase 2: Encoder & DGI Sanity Check
-    # ==========================================
-    print("=== Starting Phase 2: DGI & Encoder Sanity Check ===")
+    print("\n=== Starting Final Phase: Execution Engine ===")
     ndim_in = train_g.ndata['h'].shape[2]
     edims = train_g.edata['h'].shape[2]
     hidden_dim = 128
     edge_hidden_dim = 256
     
-    # 1. Test DGI Loss
+    # 1. GNN Model
+    print("Initializing DGI Model...")
     dgi_model = AnomalEDGI(ndim_in, edims, hidden_dim, edge_hidden_dim)
-    loss = dgi_model(train_g, train_g.ndata['h'], train_g.edata['h'])
-    print(f"Calculated DGI Loss: {loss.item():.4f}")
     
-    # 2. Get real embeddings from Encoder for Phase 3
-    print("Extracting edge embeddings from Encoder...")
-    encoder = AnomalESAGEEncoder(ndim_in, edims, hidden_dim, edge_hidden_dim)
-    _, out_e = encoder(train_g, train_g.ndata['h'], train_g.edata['h'], corrupt=False)
-    print("=== Phase 2 Execution Successful ===\n")
-
-    # ==========================================
-    # NEW: Phase 3: Anomaly Detector Sanity Check
-    # ==========================================
-    print("=== Starting Phase 3: Anomaly Detector Sanity Check ===")
-    print("Initializing HBOS Anomaly Detector...")
+    # 2. Optimizer
+    optimizer = torch.optim.Adam(dgi_model.parameters(), lr=0.001)
     
-    # Create the detector (e.g., HBOS) with a 10% expected anomaly rate
+    # 3. Anomaly Detector (HBOS with 10% contamination)
+    print("Initializing HBOS Detector...")
     detector = AnomalEDetector(model_name='hbos', contamination=0.10)
     
-    # Train the detector on the extracted edge embeddings (out_e)
-    print(f"Fitting model on embedding tensor of shape {out_e.shape}...")
-    detector.fit(out_e)
+    # 4. Trainer
+    trainer = AnomalETrainer(dgi_model, detector, optimizer, epochs=50)
     
-    # Predict normal (0) vs anomalous (1) labels
-    predictions = detector.predict(out_e)
+    # 5. Execute Pipeline
+    trainer.train(train_g, train_g.ndata['h'], train_g.edata['h'])
+    # No labels array passed here -- evaluate() reads test_g.edata['Label']
+    # internally, which is guaranteed aligned with the edge embeddings it
+    # just computed from test_g.edata['h'].
+    trainer.evaluate(test_g, test_g.ndata['h'], test_g.edata['h'])
     
-    # Calculate some basic stats to ensure it worked
-    num_anomalies = sum(predictions)
-    total_samples = len(predictions)
-    print(f"Prediction complete! Found {num_anomalies} anomalies out of {total_samples} edges.")
-    print("=== Phase 3 Execution Successful! ===")
+    print("\n🎉 === ANOMAL-E PIPELINE SUCCESSFULLY COMPLETED === 🎉")
 
 if __name__ == "__main__":
     main()
