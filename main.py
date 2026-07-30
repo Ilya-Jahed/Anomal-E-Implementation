@@ -26,11 +26,16 @@ def main():
     preprocessor = AnomalEPreprocessor()
     # Full run: sanity_check=False processes the whole dataset via memory-safe
     # chunked reading (see preprocessor.py's load_and_clean_data), keeping
-    # ~20% of rows after stratified downsampling (fraction=0.2) instead of
-    # the previous 100%, to fit within Colab's available RAM. Lower `fraction`
-    # further (e.g. 0.1) if you still hit out-of-memory errors, or raise it
-    # if you have more RAM available and want a larger training set.
-    train_df, test_df = preprocessor.process_pipeline(dataset_path, sanity_check=False, fraction=0.1)
+    # ~5% of rows after stratified downsampling (fraction=0.05). This was
+    # lowered from 0.1 after a CUDA OutOfMemoryError during training: with
+    # fraction=0.1 the graph had ~5.29M edges, and the full-batch E-GraphSAGE
+    # forward pass (which processes the entire graph at once, no
+    # mini-batching) tried to allocate more GPU memory than was available on
+    # a 14.56GB GPU. fraction=0.05 roughly halves the edge count and should
+    # fit comfortably. Raise this back up if you have a larger GPU (e.g.
+    # A100 40GB) available, or lower it further (e.g. 0.02-0.03) if you still
+    # hit CUDA OOM.
+    train_df, test_df = preprocessor.process_pipeline(dataset_path, sanity_check=False, fraction=0.05)
 
     # NOTE: we no longer extract a separate test_labels array from test_df here.
     # trainer.evaluate() now reads ground-truth labels directly from
