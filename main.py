@@ -30,7 +30,7 @@ def main():
     # the previous 100%, to fit within Colab's available RAM. Lower `fraction`
     # further (e.g. 0.1) if you still hit out-of-memory errors, or raise it
     # if you have more RAM available and want a larger training set.
-    train_df, test_df = preprocessor.process_pipeline(dataset_path, sanity_check=False, fraction=0.2)
+    train_df, test_df = preprocessor.process_pipeline(dataset_path, sanity_check=False, fraction=0.1)
 
     # NOTE: we no longer extract a separate test_labels array from test_df here.
     # trainer.evaluate() now reads ground-truth labels directly from
