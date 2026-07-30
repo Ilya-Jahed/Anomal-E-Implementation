@@ -223,12 +223,32 @@ class AnomalEPreprocessor:
         
         # Concatenate normalized features into a single vector 'h' for edge features.
         # Each row's numeric columns (everything except the two IP columns) are
-        # packed into one Python list per row. This 'h' column is exactly the
-        # edge feature vector e_uv referred to in the Anomal-E paper -- it will
-        # later be attached as the edge attribute between IPV4_SRC_ADDR and
-        # IPV4_DST_ADDR when the graph is constructed.
-        X_train['h'] = X_train.iloc[:, 2:].values.tolist()
-        X_test['h'] = X_test.iloc[:, 2:].values.tolist()
+        # packed into one per-row feature vector. This 'h' column is exactly
+        # the edge feature vector e_uv referred to in the Anomal-E paper -- it
+        # will later be attached as the edge attribute between IPV4_SRC_ADDR
+        # and IPV4_DST_ADDR when the graph is constructed.
+        #
+        # MEMORY NOTE: the previous implementation did
+        #     X_train['h'] = X_train.iloc[:, 2:].values.tolist()
+        # which (1) builds a float64 NumPy array from the numeric columns,
+        # then (2) converts EVERY element of it into an individual Python
+        # float object via .tolist(). Step (2) is the expensive one: a NumPy
+        # float64 is 8 raw bytes, but a Python float object carries ~24 bytes
+        # of interpreter overhead each -- so a matrix that's already large as
+        # a NumPy array can end up 3-4x larger once turned into nested Python
+        # lists, on top of briefly holding both representations in memory at
+        # once. This is what was exhausting Colab's RAM even at fraction=0.2.
+        #
+        # Fix: keep the values as float32 (half the memory of float64, still
+        # ample precision for L2-normalised flow features) and store one
+        # NumPy row-array per cell instead of a Python list per cell. DGL's
+        # from_networkx()/torch.tensor() (used downstream in graph_builder.py)
+        # accept NumPy arrays exactly as readily as Python lists when building
+        # the edge feature tensor, so nothing downstream needs to change.
+        train_values = X_train.iloc[:, 2:].values.astype(np.float32)
+        test_values = X_test.iloc[:, 2:].values.astype(np.float32)
+        X_train['h'] = list(train_values)
+        X_test['h'] = list(test_values)
         
         return X_train, X_test
 
