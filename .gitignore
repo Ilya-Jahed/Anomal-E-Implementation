@@ -224,3 +224,6 @@ __marimo__/
 data/
 *.csv
 *.parquet
+
+
+checkpoints/
