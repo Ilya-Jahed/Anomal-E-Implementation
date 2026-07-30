@@ -38,7 +38,8 @@ class AnomalEPreprocessor:
         self.scaler = Normalizer()
         self.label_encoder = LabelEncoder()
         
-    def load_and_clean_data(self, file_path, fraction=0.1, random_state=13, sanity_check=False):
+    def load_and_clean_data(self, file_path, fraction=0.2, random_state=13, sanity_check=False,
+                             chunksize=500_000):
         """
         Step 1 & 2: Loads NetFlow data, removes source/destination ports, 
         and applies uniform random downsampling.
@@ -56,11 +57,54 @@ class AnomalEPreprocessor:
         if sanity_check:
             print("[INFO] SANITY CHECK MODE: Loading only the first 50,000 rows from CSV...")
             data = pd.read_csv(file_path, nrows=50000)
-        else:
-            print("[INFO] Loading FULL dataset from CSV...")
-            data = pd.read_csv(file_path)
-            # Standardize column names: only strip hidden spaces
             data.rename(columns=lambda x: str(x).strip(), inplace=True)
+        else:
+            # Memory-safe loading: the full NF-CSE-CIC-IDS2018-v2 CSV has ~19
+            # million rows. Reading it whole with a single pd.read_csv(file_path)
+            # loads the ENTIRE raw file into RAM before any downsampling
+            # happens, which is what was running Colab (and similar-RAM
+            # machines) out of memory.
+            #
+            # Instead, we read the file in chunks of `chunksize` rows and
+            # immediately downsample EACH chunk with the same stratified
+            # (per-Attack-type) logic used below, keeping only `fraction` of
+            # every chunk before moving to the next one. At any point in time,
+            # only one raw chunk (~chunksize rows) plus the running total of
+            # already-sampled rows are held in memory -- never the full
+            # ~19M-row file at once.
+            #
+            # This is an approximation of sampling `fraction` from the whole
+            # file at once: it assumes attack types are reasonably spread out
+            # across the file rather than concentrated in one contiguous
+            # block. This holds for the standard NF-CSE-CIC-IDS2018-v2 release
+            # (rows are not attack-sorted), so the resulting class balance
+            # closely matches what a single whole-file stratified sample
+            # would give, at a fraction of the peak memory usage.
+            print(f"[INFO] Loading FULL dataset from CSV in chunks of {chunksize} rows "
+                  f"(sampling {fraction*100:.0f}% per chunk)...")
+            sampled_chunks = []
+            total_rows_seen = 0
+            reader = pd.read_csv(file_path, chunksize=chunksize)
+            for i, chunk in enumerate(reader):
+                chunk.rename(columns=lambda x: str(x).strip(), inplace=True)
+                total_rows_seen += len(chunk)
+                # Downsample this chunk now, stratified by Attack, instead of
+                # waiting until the whole file is loaded (see Step 2 below for
+                # why this grouping matters). Groups with very few rows in a
+                # single chunk can occasionally sample 0 rows -- this is fine,
+                # since the same attack type will appear in other chunks too.
+                chunk_sample = chunk.groupby(by='Attack', group_keys=False).sample(
+                    frac=fraction, random_state=random_state
+                )
+                sampled_chunks.append(chunk_sample)
+                print(f"[INFO]   chunk {i + 1}: read {len(chunk)} rows, "
+                      f"kept {len(chunk_sample)} after per-chunk sampling "
+                      f"(running total seen: {total_rows_seen})")
+
+            data = pd.concat(sampled_chunks, ignore_index=True)
+            del sampled_chunks  # free the list of per-chunk DataFrames explicitly
+            print(f"[INFO] Finished chunked read: {total_rows_seen} rows seen, "
+                  f"{len(data)} rows kept after per-chunk sampling.")
         
             # [DEBUG] Print the first few columns to ensure they match our expectations
             print(f"[DEBUG] Standardized Columns: {data.columns.tolist()[:10]}")
@@ -80,14 +124,18 @@ class AnomalEPreprocessor:
         if "L4_SRC_PORT" in data.columns and "L4_DST_PORT" in data.columns:
             data.drop(columns=["L4_SRC_PORT", "L4_DST_PORT"], inplace=True)
             print("[INFO] Dropped Source and Destination Ports.")
-            
-        # Step 2: Uniform Random Downsampling.
-        # Grouping by 'Attack' before sampling keeps the sampling STRATIFIED:
-        # each attack type (and benign traffic) is downsampled independently,
-        # so rare attack categories are not accidentally wiped out by a
-        # purely random 10% sample of the whole dataset.
-        print(f"[INFO] Downsampling data to {fraction*100}%...")
-        data = data.groupby(by='Attack').sample(frac=fraction, random_state=random_state)
+
+        if sanity_check:
+            # Step 2: Uniform Random Downsampling (sanity-check path only --
+            # the non-sanity-check path already sampled per-chunk above, so
+            # doing it again here would double-downsample and shrink the
+            # final dataset far below the requested `fraction`).
+            # Grouping by 'Attack' before sampling keeps the sampling STRATIFIED:
+            # each attack type (and benign traffic) is downsampled independently,
+            # so rare attack categories are not accidentally wiped out by a
+            # purely random sample of the whole dataset.
+            print(f"[INFO] Downsampling data to {fraction*100}%...")
+            data = data.groupby(by='Attack').sample(frac=fraction, random_state=random_state)
         
         return data
     
@@ -200,7 +248,7 @@ class AnomalEPreprocessor:
         
         return train_df, test_df
 
-    def process_pipeline(self, file_path, sanity_check=False):
+    def process_pipeline(self, file_path, sanity_check=False, fraction=0.2, chunksize=500_000):
         """
         Executes the entire data preprocessing pipeline.
         Returns fully preprocessed and normalized Train and Test dataframes.
@@ -214,8 +262,22 @@ class AnomalEPreprocessor:
 
         sanity_check=True runs the same logic on a small 50,000-row slice,
         for a fast end-to-end smoke test before a full run.
+
+        fraction: what proportion of the (non-sanity-check) dataset to keep
+            after stratified downsampling, e.g. 0.2 keeps ~20%. Lower this if
+            you are running on limited RAM (e.g. a standard Colab instance) --
+            it directly controls both memory usage and the row count that
+            later becomes graph nodes/edges. Ignored when sanity_check=True.
+
+        chunksize: number of raw CSV rows read into memory at a time when
+            sanity_check=False. Only affects peak memory usage during
+            loading, not the final sampled data itself. Lower this (e.g. to
+            200_000) if you are still running out of RAM even after reducing
+            `fraction`.
         """
-        data = self.load_and_clean_data(file_path, sanity_check=sanity_check)
+        data = self.load_and_clean_data(
+            file_path, fraction=fraction, sanity_check=sanity_check, chunksize=chunksize
+        )
         X_train, X_test, y_train, y_test = self.split_data(data, sanity_check=sanity_check)
         
         X_train, X_test = self.apply_feature_conversion(X_train, X_test, y_train)

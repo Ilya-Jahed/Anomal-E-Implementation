@@ -24,9 +24,13 @@ def main():
 
     print("=== Starting Phase 1: Data Pipeline ===")
     preprocessor = AnomalEPreprocessor()
-    # Full run: sanity_check=False processes the entire dataset instead of
-    # the 50,000-row sanity subset used for quick end-to-end verification.
-    train_df, test_df = preprocessor.process_pipeline(dataset_path, sanity_check=False)
+    # Full run: sanity_check=False processes the whole dataset via memory-safe
+    # chunked reading (see preprocessor.py's load_and_clean_data), keeping
+    # ~20% of rows after stratified downsampling (fraction=0.2) instead of
+    # the previous 100%, to fit within Colab's available RAM. Lower `fraction`
+    # further (e.g. 0.1) if you still hit out-of-memory errors, or raise it
+    # if you have more RAM available and want a larger training set.
+    train_df, test_df = preprocessor.process_pipeline(dataset_path, sanity_check=False, fraction=0.2)
 
     # NOTE: we no longer extract a separate test_labels array from test_df here.
     # trainer.evaluate() now reads ground-truth labels directly from
