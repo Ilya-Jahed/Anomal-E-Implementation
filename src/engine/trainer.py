@@ -57,28 +57,67 @@ class AnomalETrainer:
         # Populated by train(); kept around for later inspection / plotting.
         self.loss_history: List[float] = []
 
-    def train(self, g, n_features: torch.Tensor, e_features: torch.Tensor) -> List[float]:
+    def train(
+        self,
+        g,
+        n_features: torch.Tensor,
+        e_features: torch.Tensor,
+        checkpoint_path: Optional[str] = None,
+        checkpoint_every: int = 10,
+        start_epoch: int = 0,
+    ) -> List[float]:
         """
         Runs the self-supervised DGI training loop (Algorithm 2, lines 2-9).
 
         The loss comes entirely from `dgi_model`'s internal real-vs-corrupted
         discrimination signal -- no labels are read or needed here.
 
+        Mid-training checkpointing: if `checkpoint_path` is given, a checkpoint
+        is saved every `checkpoint_every` epochs (and always after the final
+        epoch), so a dropped Colab session loses at most `checkpoint_every - 1`
+        epochs of progress instead of the entire run. `start_epoch` lets a
+        resumed run continue numbering/logging from where a previous run left
+        off, instead of restarting the epoch counter at 1 (the actual model
+        and optimizer state are restored separately, via load_checkpoint()
+        before this method is called -- this parameter only affects the
+        loop's epoch range and its log messages).
+
         Args:
             g: training DGL graph (e.g. train_g).
             n_features: node feature tensor, shape (N, 1, ndim_in).
             e_features: edge feature tensor, shape (E, 1, edims).
+            checkpoint_path: if given, path to save periodic checkpoints to.
+                If None, no mid-training checkpointing happens (matches the
+                previous behaviour of this method exactly).
+            checkpoint_every: how often (in epochs) to save a checkpoint,
+                when `checkpoint_path` is given. Ignored if checkpoint_path
+                is None.
+            start_epoch: epoch number to resume from (0 for a fresh run, or
+                the value returned by a prior load_checkpoint() call). Only
+                changes what gets logged/looped over here -- it does NOT by
+                itself restore model weights; call load_checkpoint() first.
 
         Returns:
             List of per-epoch loss values (also stored in self.loss_history).
+            When resuming (start_epoch > 0), this list only contains losses
+            from THIS call's epochs, not the previous run's -- self.loss_history
+            is reset at the start of every train() call, same as before.
         """
-        print(f"\n--- Starting DGI Training for {self.epochs} Epochs ---")
+        remaining_epochs = self.epochs - start_epoch
+        if remaining_epochs <= 0:
+            print(
+                f"[INFO] start_epoch ({start_epoch}) >= self.epochs ({self.epochs}) -- "
+                "nothing left to train, skipping."
+            )
+            return self.loss_history
+
+        print(f"\n--- Starting DGI Training: epoch {start_epoch + 1} to {self.epochs} ---")
         self.dgi_model.train()
         self.loss_history = []
 
         training_start = time.time()
 
-        for epoch in range(self.epochs):
+        for epoch in range(start_epoch, self.epochs):
             t0 = time.time()
 
             self.optimizer.zero_grad()
@@ -90,14 +129,25 @@ class AnomalETrainer:
             loss_value = loss.item()
             self.loss_history.append(loss_value)
 
-            if (epoch + 1) % self.log_every == 0 or epoch == 0:
+            if (epoch + 1) % self.log_every == 0 or epoch == start_epoch:
                 print(
                     f"Epoch {epoch + 1:03d}/{self.epochs} | "
                     f"Loss: {loss_value:.4f} | Time: {t1 - t0:.4f}s"
                 )
 
+            # Mid-training checkpoint: save every `checkpoint_every` epochs,
+            # and unconditionally on the very last epoch, so a run that
+            # finishes cleanly always ends with an up-to-date checkpoint on
+            # disk even if `checkpoint_every` doesn't evenly divide the
+            # remaining epoch count.
+            is_last_epoch = (epoch == self.epochs - 1)
+            if checkpoint_path is not None and (
+                (epoch + 1) % checkpoint_every == 0 or is_last_epoch
+            ):
+                self.save_checkpoint(checkpoint_path, epoch=epoch + 1)
+
         total_time = time.time() - training_start
-        best_epoch = self.loss_history.index(min(self.loss_history)) + 1
+        best_epoch = self.loss_history.index(min(self.loss_history)) + start_epoch + 1
         print(
             f"--- DGI Training Completed | Total Time: {total_time:.2f}s | "
             f"Final Loss: {self.loss_history[-1]:.4f} | "
@@ -205,26 +255,51 @@ class AnomalETrainer:
 
         return {"auc": auc, "f1": f1, "precision": precision, "recall": recall}
 
-    def save_checkpoint(self, path: str) -> None:
+    def save_checkpoint(self, path: str, epoch: Optional[int] = None) -> None:
         """
-        Saves model + optimizer state and loss history to `path`.
-        Purely additive: lets training be resumed or the trained encoder be
-        reused later without rerunning the full DGI loop from scratch.
+        Saves model + optimizer state, loss history, and how many epochs of
+        training have completed so far, to `path`.
+
+        Purely additive: lets training be resumed (from train()'s mid-training
+        checkpointing) or the trained encoder be reused later without
+        rerunning the full DGI loop from scratch.
+
+        Args:
+            path: file path to save the checkpoint to.
+            epoch: number of epochs completed so far (1-indexed, i.e. "10"
+                means epochs 1 through 10 have run). If None (e.g. when
+                called manually after a fully finished train() run outside
+                of its own mid-training checkpointing), defaults to
+                `self.epochs` -- i.e. assumes training is fully complete.
         """
+        completed_epochs = epoch if epoch is not None else self.epochs
         torch.save(
             {
                 "dgi_model_state": self.dgi_model.state_dict(),
                 "optimizer_state": self.optimizer.state_dict(),
                 "loss_history": self.loss_history,
+                "epoch": completed_epochs,
             },
             path,
         )
-        print(f"Checkpoint saved to: {path}")
+        print(f"Checkpoint saved to: {path} (epoch {completed_epochs}/{self.epochs})")
 
-    def load_checkpoint(self, path: str, map_location=None) -> None:
-        """Restores model + optimizer state and loss history from `path`."""
+    def load_checkpoint(self, path: str, map_location=None) -> int:
+        """
+        Restores model + optimizer state and loss history from `path`.
+
+        Returns:
+            int: the number of epochs already completed as of this
+                checkpoint (0 if the checkpoint predates this field, for
+                backward compatibility with checkpoints saved before
+                mid-training checkpointing was added). Pass this straight
+                into train()'s `start_epoch` argument to resume correctly:
+                `start_epoch = trainer.load_checkpoint(path)`.
+        """
         checkpoint = torch.load(path, map_location=map_location)
         self.dgi_model.load_state_dict(checkpoint["dgi_model_state"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state"])
         self.loss_history = checkpoint.get("loss_history", [])
-        print(f"Checkpoint loaded from: {path}")
+        completed_epochs = checkpoint.get("epoch", 0)
+        print(f"Checkpoint loaded from: {path} (epoch {completed_epochs}/{self.epochs} completed)")
+        return completed_epochs
