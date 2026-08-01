@@ -73,7 +73,7 @@ itself — see §4a).
 | `epochs` | `int` | Number of full passes over the graph during training. Raises `ValueError` if not positive. |
 | `log_every` | `int` | Print a progress line every N epochs, plus always at epoch 1. Raises `ValueError` if not positive. |
 
-### `train(g, n_features, e_features) -> List[float]`
+### `train(g, n_features, e_features, checkpoint_path=None, checkpoint_every=10, start_epoch=0) -> List[float]`
 
 Runs the DGI training loop for `self.epochs` iterations.
 
@@ -85,8 +85,22 @@ Runs the DGI training loop for `self.epochs` iterations.
   `l1 + l2` — see `DGI_MODULE_EXPLANATION.md` §4.2 for the full derivation.
 - **No labels appear anywhere in this method** — the method's signature has no
   label-related parameter at all.
+- **Mid-training checkpointing (`checkpoint_path`, `checkpoint_every`):** if
+  `checkpoint_path` is given, a checkpoint is saved every `checkpoint_every`
+  epochs, and unconditionally on the final epoch — so a run that finishes
+  cleanly always ends with an up-to-date checkpoint on disk, and an
+  interrupted run loses at most `checkpoint_every - 1` epochs of progress.
+- **Resuming (`start_epoch`):** typically the return value of a prior
+  `load_checkpoint()` call. Lets the epoch counter and log messages continue
+  from where a previous run left off, instead of restarting at 1. This
+  parameter only affects looping/logging — it does **not** by itself restore
+  model weights; `load_checkpoint()` must be called separately, before
+  `train()`, to actually restore state. If `start_epoch >= self.epochs`,
+  the method logs that there's nothing left to train and returns immediately.
 - **Returns:** the list of per-epoch loss values (also cached in
-  `self.loss_history`). Logged at the end: total wall-clock time, final loss,
+  `self.loss_history`, reset at the start of every `train()` call — so on a
+  resumed run, this list only contains the current call's losses, not the
+  previous run's). Logged at the end: total wall-clock time, final loss,
   and the best (lowest) loss with the epoch it occurred at.
 
 ### `evaluate(g, n_features, e_features, label_key='Label') -> Dict[str, Optional[float]]`
@@ -119,58 +133,89 @@ Returns a dict (`{"auc", "f1", "precision", "recall"}`) instead of a bare tuple
 so callers can log, compare across detector hyperparameter sweeps, or write to
 a results file without depending on positional order.
 
-### `save_checkpoint(path)` / `load_checkpoint(path, map_location=None)`
+### `save_checkpoint(path, epoch=None)` / `load_checkpoint(path, map_location=None) -> int`
 
 Persist/restore `dgi_model`'s and `optimizer`'s state dicts plus
-`loss_history`. Useful for resuming a long training run or reusing a trained
-encoder across multiple detector experiments (Table 2's grid search) without
-retraining the GNN each time. Purely additive utilities — no other method
-depends on them.
+`loss_history` and the completed-epoch count. `save_checkpoint`'s `epoch`
+parameter defaults to `self.epochs` (i.e. "assume training is fully complete")
+when not given — this matters when called manually outside of `train()`'s own
+mid-training checkpointing loop. `load_checkpoint` returns the completed-epoch
+count read from the checkpoint (`0` if that field is missing, for backward
+compatibility with checkpoints saved before mid-training checkpointing was
+added), meant to be passed straight into `train()`'s `start_epoch` argument.
+Useful for resuming a long training run or reusing a trained encoder across
+multiple detector experiments (Table 2's grid search) without retraining the
+GNN each time. Purely additive utilities — no other method depends on them.
 
 ---
 
 ## 4a. Why Labels Are Read From the Graph, Not From the Dataframe
 
-### The mechanism (confirmed against `graph_builder.py` and the reference notebook)
+### The mechanism (confirmed against `graph_builder.py`, no NetworkX involved)
 
-`AnomalEGraphBuilder._build_single_graph` does, in order:
+`AnomalEGraphBuilder._build_single_graph` does **not** use NetworkX at all —
+an earlier version did (`nx.from_pandas_edgelist` → `.to_directed()` →
+`dgl.from_networkx`), but that path was replaced because NetworkX represents
+every edge as its own Python dictionary object, which was too slow and
+memory-hungry once memory-safe chunked CSV loading made larger `fraction`
+values practical. The current implementation builds the same graph structure
+directly with `pandas.factorize` and vectorised NumPy/PyTorch operations:
 
 ```python
-nx_g = nx.from_pandas_edgelist(df, source=..., target=..., edge_attr=["h", "Label", "Attack"],
-                                create_using=nx.MultiGraph())
-nx_g = nx_g.to_directed()
-dgl_g = dgl.from_networkx(nx_g, edge_attrs=["h", "Attack", "Label"])
+all_ips = pd.concat([df["IPV4_SRC_ADDR"], df["IPV4_DST_ADDR"]], ignore_index=True)
+node_ids, unique_ips = pd.factorize(all_ips)
+src_ids = node_ids[:num_rows]
+dst_ids = node_ids[num_rows:]
+
+# Build directed edges in BOTH directions for every flow:
+src_all = np.concatenate([src_ids, dst_ids])
+dst_all = np.concatenate([dst_ids, src_ids])
+
+h_values = np.stack(df["h"].values).astype(np.float32)
+h_all = np.concatenate([h_values, h_values], axis=0)   # duplicated the same way as src_all/dst_all
+
+label_values = df["Label"].to_numpy()
+label_all = np.concatenate([label_values, label_values], axis=0)  # same duplication pattern
 ```
 
-`nx.MultiGraph.to_directed()` doesn't add a `V→U` mirror alongside each
-`U→V` edge in dataframe order — it rebuilds the edge list by walking node
-adjacency (grouped by source node), and because undirected multigraph
-adjacency is stored symmetrically, this can even produce more directed
-edges than original rows whenever a node pair has flows recorded in *both*
-directions (verified empirically: `A→B` and a separate real `B→A` flow
-between the same pair combine into 4 directed edges, two of which pair the
-wrong direction with the wrong feature/label). A labels array pulled
-separately from the dataframe's row order is therefore **not guaranteed to
-line up with `dgl_g`'s edge order** — not even approximately, and not
-fixable by any positional slicing.
+`src_all`/`dst_all` are built as `[forward edges, reverse edges]` — every
+original flow `u→v` produces both `u→v` (real) and `v→u` (manufactured,
+carrying identical `h`/`Label`/`Attack` values). `h_all` and `label_all` are
+concatenated in that exact same `[forward, reverse]` order, so entry `i` and
+entry `i + num_rows` of every array always correspond to the same pair of
+directed edges. This is a deliberate design choice rather than an
+NetworkX-adjacency side effect, but it produces the same practical outcome
+described below: if a node pair has *real*, independently-observed flows in
+*both* directions (e.g. a real `A→B` attack flow and a separate real `B→A`
+benign flow), the resulting graph ends up with two edges in the `A→B`
+direction carrying contradictory labels — one from the real `A→B` flow, one
+manufactured as a copy of the real `B→A` flow's features. `dgl.graph(...)`
+supports parallel/multi-edges by default, so both are kept rather than one
+overwriting the other; nothing in this construction path filters or resolves
+that contradiction.
 
-**This is not a bug specific to this project** — it's confirmed to be
-exactly how the original Anomal-E reference implementation (the authors'
-own notebook) builds its graphs too, using the identical
-`MultiGraph → to_directed() → dgl.from_networkx` sequence. Reproducing it
-faithfully here is the correct choice for results to be comparable to the
-paper.
+A labels array pulled separately from the dataframe's original row order
+is therefore **not guaranteed to line up with `dgl_g`'s edge order** — the
+graph has up to `2×` the row count, in a `[forward, reverse]` order that a
+plain dataframe-order array does not follow, and no positional slicing of
+the dataframe recovers that order.
+
+**This duplication pattern is not a bug specific to this project** — it's
+confirmed to reproduce exactly what the original Anomal-E reference
+implementation (the authors' own notebook, via `MultiGraph → to_directed()`)
+produces. Reproducing it faithfully here is the correct choice for results to
+be comparable to the paper, even after the NetworkX-based construction path
+itself was replaced for performance reasons.
 
 ### The fix: read labels off the graph, not off the dataframe
 
-`edge_attr=["h", "Label", "Attack"]` means `Label` travels alongside `h`
-through every conversion step — `from_pandas_edgelist` → `to_directed()`
-(which deep-copies edge data onto every directed copy it creates) →
-`dgl.from_networkx`. Whatever order `dgl_g`'s edges end up in,
-`dgl_g.edata['Label']` and `dgl_g.edata['h']` were built from the *same*
-iteration and are therefore always mutually consistent — and, by
-extension, consistent with `edge_embeddings`, which the encoder computes
-straight from `g.edata['h']`.
+Because `h_all`, `label_all`, and `attack_all` are all built from the exact
+same `[forward, reverse]` concatenation as `src_all`/`dst_all` (Step 3-4 of
+`_build_single_graph`, see `DATA_PIPELINE_EXPLANATION.md` Part B), whatever
+order `dgl_g`'s edges end up in, `dgl_g.edata['Label']` and `dgl_g.edata['h']`
+were built from the *same* construction pass and are therefore always
+mutually consistent — and, by extension, consistent with `edge_embeddings`,
+which the encoder computes straight from `g.edata['h']`.
 
 `evaluate()` uses this directly:
 
@@ -180,13 +225,13 @@ if isinstance(labels_to_use, torch.Tensor):
     labels_to_use = labels_to_use.detach().cpu().numpy()
 ```
 
-**This matches the reference notebook exactly** — its evaluation cells
-also read `train_g.edata['Label']` / `test_g.edata['Label']` directly
-rather than tracking a separately-extracted labels array, for precisely
-this reason. No slicing, no assumption about edge ordering — it works
-regardless of how NetworkX/DGL order or duplicate edges internally,
-because the labels were never separated from the edges in the first
-place.
+**This matches the reference notebook's evaluation behaviour** — its
+evaluation cells also read `train_g.edata['Label']` / `test_g.edata['Label']`
+directly rather than tracking a separately-extracted labels array, for
+precisely this reason. No slicing, no assumption about edge ordering — it
+works regardless of how the graph-construction step orders or duplicates
+edges internally, because the labels were never separated from the edges in
+the first place.
 
 ### There is no `true_labels` override parameter — and that's deliberate
 
@@ -195,10 +240,10 @@ parameter, honored only when its length happened to match `g`'s edge
 count. That parameter has been **removed entirely**, not just left unused
 by default. The reasoning: a length match is a *necessary* but not
 *sufficient* condition for a label array to actually be aligned with
-`edge_embeddings` — as shown above, `to_directed()`'s reordering means a
-same-length array built from the dataframe's original row order can still
-be silently misaligned with the graph's actual edge order. Keeping that
-parameter around, even as an opt-in override, preserved exactly the
+`edge_embeddings` — as shown above, the forward+reverse edge duplication
+means a same-length array built from the dataframe's original row order can
+still be silently misaligned with the graph's actual edge order. Keeping
+that parameter around, even as an opt-in override, preserved exactly the
 failure mode this design is meant to eliminate: a caller could pass a
 plausible-looking but wrongly-ordered array and get back confidently
 wrong metrics with no error at all.
@@ -219,14 +264,17 @@ order-safe.
 
 ### A known characteristic worth being aware of, not a bug to chase
 
-Because `to_directed()` mirrors every edge (and, for node pairs with
-flows in both real directions, produces a few mismatched combinations too,
-as shown above), evaluation runs over roughly `2×` the original row count,
-including edges that don't correspond to an independently-observed flow.
-The reference implementation does not filter these out, and neither does
-this codebase — deviating from that would produce metrics that are no
-longer comparable to the paper's Tables 3-8. This is simply how the
-Anomal-E method evaluates, not a defect introduced by this reimplementation.
+Because every original flow is duplicated into a forward and a manufactured
+reverse edge (and, for node pairs with flows in both real directions,
+produces a couple of label-contradicting edges too, as shown above),
+evaluation runs over roughly `2×` the original row count, including edges
+that don't correspond to an independently-observed flow. The reference
+implementation does not filter these out, and neither does this codebase —
+deviating from that would produce metrics that are no longer comparable to
+the paper's Tables 3-8. This is simply how the Anomal-E method evaluates,
+not a defect introduced by this reimplementation. (For a deeper look at
+whether this duplication pattern helps or hurts reported results, see the
+discussion in `DATA_PIPELINE_EXPLANATION.md`.)
 
 ---
 
@@ -236,21 +284,23 @@ Anomal-E method evaluates, not a defect introduced by this reimplementation.
   only that** — see §4a for why a dataframe-order array can't be trusted
   here, and why the earlier `true_labels` override parameter was removed
   rather than kept as an opt-in. This matches the original Anomal-E
-  reference notebook's own evaluation cells exactly, and confirms
-  `graph_builder.py` itself needs no changes — the `MultiGraph → to_directed()`
-  pattern it uses is a faithful reproduction of the reference implementation,
-  not a defect. The reference `main.py` no longer extracts labels from
-  `test_df` at all; it just calls `trainer.evaluate(test_g, ...)`.
+  reference notebook's own evaluation cells exactly. The current
+  `graph_builder.py` (no NetworkX, `pandas.factorize`-based) reproduces the
+  same forward+reverse edge duplication pattern as the reference
+  implementation, just via a faster construction path — the label-ordering
+  guarantee holds either way, because both paths keep `h`/`Label`/`Attack`
+  concatenated in lockstep. The reference `main.py` no longer extracts
+  labels from `test_df` at all; it just calls `trainer.evaluate(test_g, ...)`.
 - **`detector.model_name` is read defensively** via `getattr(..., default=type(...).__name__)`
   purely for the log line in step 2 of `evaluate()` — if the detector doesn't
   expose that attribute, evaluation still proceeds normally.
 - **No labels leak into `train()`** by construction — the method's signature
   simply has no parameter through which a label could be passed.
 - **GPU/device placement is not handled inside the trainer.** Tensors and the
-  model must already be on the same device before being passed in; this
-  mirrors the rest of the current pipeline (`preprocessor.py` /
-  `graph_builder.py` are CPU-only), but is worth revisiting if the full
-  (non-`sanity_check`) dataset is trained on GPU.
+  model must already be on the same device before being passed in — `main.py`
+  now moves `train_g`/`test_g` (and therefore their `ndata`/`edata`) to
+  `device` before calling into the trainer, so this is handled by the caller,
+  not by `AnomalETrainer` itself.
 
 ---
 
@@ -261,8 +311,11 @@ from src.engine.trainer import AnomalETrainer
 
 trainer = AnomalETrainer(dgi_model, detector, optimizer, epochs=50)
 
-# Training — no labels involved.
-trainer.train(train_g, train_g.ndata['h'], train_g.edata['h'])
+# Training — no labels involved. Optionally checkpoint every 10 epochs.
+trainer.train(
+    train_g, train_g.ndata['h'], train_g.edata['h'],
+    checkpoint_path="checkpoints/anomal_e_dgi.pt", checkpoint_every=10,
+)
 
 # Evaluation — labels are read straight from test_g.edata['Label'], no
 # separately-extracted array needed or accepted.
@@ -271,6 +324,13 @@ print(metrics["f1"])
 
 # Optional: persist the trained encoder + discriminator for later reuse.
 trainer.save_checkpoint("checkpoints/dgi_run1.pt")
+```
+
+Resuming a previously-checkpointed run:
+
+```python
+start_epoch = trainer.load_checkpoint("checkpoints/anomal_e_dgi.pt", map_location=device)
+trainer.train(train_g, train_g.ndata['h'], train_g.edata['h'], start_epoch=start_epoch)
 ```
 
 Reproducing a detector hyperparameter sweep (Table 2) without retraining the
@@ -300,10 +360,10 @@ metrics = trainer.evaluate(test_g, test_g.ndata['h'], test_g.edata['h'], label_k
 | Concept | What it is | Where in this file |
 |---|---|---|
 | `loss_history` | Per-epoch DGI loss values from the last `train()` call | Populated in `train`, usable for plotting convergence |
-| `train()` | Runs Algorithm 2's training step for `epochs` iterations, label-free by signature | Core training loop |
+| `train()` | Runs Algorithm 2's training step for `epochs` iterations, label-free by signature, with optional mid-training checkpointing and resume support | Core training loop |
 | `evaluate()` | Freezes encoder → detector.fit → predict/score → metrics vs. ground truth | The only place ground-truth labels are read |
 | Label sourcing | Reads `g.edata[label_key]` directly — the only accepted source, no override parameter | `evaluate()`, step 2 — see §4a for why |
-| `save_checkpoint` / `load_checkpoint` | Persist/restore model + optimizer + loss history | Additive utility, not required for a single run |
+| `save_checkpoint` / `load_checkpoint` | Persist/restore model + optimizer + loss history + completed-epoch count | Additive utility; `load_checkpoint`'s return value feeds `train()`'s `start_epoch` |
 | ROC AUC guard | `try/except ValueError` around `roc_auc_score` | Prevents a single-class label split from crashing evaluation |
 
 ---
@@ -315,8 +375,9 @@ components — an encoder, a discriminator, an optimizer, a classical outlier
 detector — into an actual experiment. `train()` repeatedly asks the DGI model
 "how well can you currently tell real graphs from shuffled ones?" and lets
 gradient descent push that answer higher, never once looking at a label —
-its signature doesn't even leave room for one. Only after training is frozen
-does `evaluate()` hand the resulting edge embeddings to a classical detector
-and, for the first and only time in this class, compare its guesses against
-ground truth read directly off the graph — producing the numbers that
-actually appear in the paper's result tables.
+its signature doesn't even leave room for one — while optionally saving its
+progress to disk along the way so a long run can be resumed if interrupted.
+Only after training is frozen does `evaluate()` hand the resulting edge
+embeddings to a classical detector and, for the first and only time in this
+class, compare its guesses against ground truth read directly off the graph
+— producing the numbers that actually appear in the paper's result tables.
